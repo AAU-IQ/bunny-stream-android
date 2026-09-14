@@ -1,3 +1,4 @@
 <resources>
     <item name="speed_badge" type="id"/>
+    <item name="skip_badge" type="id" />
 </resources>

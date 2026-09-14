@@ -7,5 +7,7 @@
     <string name="error_playing_video">تعذر تشغيل الفيديو</string>
     <string name="label_video_settings_captions_disabled">معطّل</string>
     <string name="label_video_settings_audio_track">المسار الصوتي</string>
+    <string name="label_skip_forward">+%1$d ث</string>
+    <string name="label_skip_backward">-%1$d ث</string>
     <string name="label_drm_not_supported_exception">تم تمكين DRM لهذا الفيديو، التشغيل غير مدعوم على هذا الجهاز.</string>
 </resources>
