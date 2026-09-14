@@ -7,8 +7,11 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.AttributeSet
 import android.util.Log
+import android.view.GestureDetector
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.Menu
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -61,6 +64,9 @@ class BunnyPlayerView @JvmOverloads constructor(
 
     companion object {
         private const val TAG = "BunnyPlayerView"
+        private const val GESTURE_SKIP_MS = 5_000L
+        private const val HOLD_SPEED = 2f
+        private const val SKIP_BADGE_VISIBLE_MS = 700L
     }
 
     interface FullscreenListener {
@@ -230,6 +236,59 @@ class BunnyPlayerView @JvmOverloads constructor(
     }
 
     private val i18n = I18n(context)
+
+    private var speedBeforeHold: Float? = null
+
+    private val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
+        override fun onDown(e: MotionEvent): Boolean = true
+
+        override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+            performClick()
+            return true
+        }
+
+        override fun onDoubleTap(e: MotionEvent): Boolean {
+            skip(forward = e.x > width / 2f)
+            return true
+        }
+
+        override fun onLongPress(e: MotionEvent) {
+            startHoldSpeed()
+        }
+    })
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        gestureDetector.onTouchEvent(event)
+        if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
+            stopHoldSpeed()
+        }
+        return true
+    }
+
+    private fun skip(forward: Boolean) {
+        val player = bunnyPlayer ?: return
+        val offset = if (forward) GESTURE_SKIP_MS else -GESTURE_SKIP_MS
+        val duration = player.getDuration()
+        val upperBound = if (duration > 0) duration else Long.MAX_VALUE
+        player.seekTo((player.getCurrentPosition() + offset).coerceIn(0L, upperBound))
+        showSkipBadge(forward)
+    }
+
+    private fun startHoldSpeed() {
+        val player = bunnyPlayer ?: return
+        if (speedBeforeHold != null) return
+        speedBeforeHold = player.getSpeed()
+        player.setSpeed(HOLD_SPEED)
+        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        showSpeedBadge(HOLD_SPEED, autoHide = false)
+    }
+
+    private fun stopHoldSpeed() {
+        val speed = speedBeforeHold ?: return
+        speedBeforeHold = null
+        bunnyPlayer?.setSpeed(speed)
+        hideSpeedBadge()
+    }
 
 // Add this method to BunnyPlayerView.kt in the setPlayerControls() method
 
@@ -510,15 +569,22 @@ class BunnyPlayerView @JvmOverloads constructor(
         return speedMenuIds
     }
 
-    private fun showSpeedBadge(speed: Float) {
+    private fun showSpeedBadge(speed: Float, autoHide: Boolean = true) {
         if (speed == 1.0f) {
             hideSpeedBadge()
             return
         }
 
-        val speedBadge = findViewById<TextView>(R.id.speed_badge) ?: createSpeedBadge()
+        val speedBadge = findViewById<TextView>(R.id.speed_badge)
+            ?: createBadge(R.id.speed_badge, Gravity.TOP or Gravity.END, topMarginDp = 60, sideMarginDp = 16)
         speedBadge.text = PlaybackSpeedManager().getSpeedDisplayText(speed).replace("×", "x")
         speedBadge.isVisible = true
+
+        if (!autoHide) {
+            speedBadge.animate().cancel()
+            speedBadge.alpha = 1.0f
+            return
+        }
 
         // Auto-hide after 2 seconds
         speedBadge.animate()
@@ -534,9 +600,25 @@ class BunnyPlayerView @JvmOverloads constructor(
             }
     }
 
-    private fun createSpeedBadge(): TextView {
+    private fun showSkipBadge(forward: Boolean) {
+        val gravity = Gravity.CENTER_VERTICAL or if (forward) Gravity.RIGHT else Gravity.LEFT
+        findViewById<TextView>(R.id.skip_badge)?.let { overlay.removeView(it) }
+        val badge = createBadge(R.id.skip_badge, gravity, topMarginDp = 0, sideMarginDp = 32)
+        val seconds = (GESTURE_SKIP_MS / 1000).toInt()
+        val template = if (forward) R.string.label_skip_forward else R.string.label_skip_backward
+        badge.text = i18n.getTranslation(template).format(seconds)
+        badge.isVisible = true
+        badge.alpha = 1.0f
+        badge.animate()
+            .setStartDelay(SKIP_BADGE_VISIBLE_MS)
+            .alpha(0.0f)
+            .setDuration(200)
+            .withEndAction { overlay.removeView(badge) }
+    }
+
+    private fun createBadge(viewId: Int, gravity: Int, topMarginDp: Int, sideMarginDp: Int): TextView {
         val speedBadge = TextView(context).apply {
-            id = R.id.speed_badge
+            id = viewId
             setTextColor(Color.WHITE)
             setBackgroundResource(R.drawable.speed_badge_background) // You'll need to create this
             setPadding(dpToPx(8), dpToPx(4), dpToPx(8), dpToPx(4))
@@ -545,14 +627,12 @@ class BunnyPlayerView @JvmOverloads constructor(
             isVisible = false
         }
 
-        // Add to overlay
-        val overlay = findViewById<FrameLayout>(androidx.media3.ui.R.id.exo_overlay)
         val layoutParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT,
             FrameLayout.LayoutParams.WRAP_CONTENT
         ).apply {
-            gravity = Gravity.TOP or Gravity.END
-            setMargins(0, dpToPx(60), dpToPx(16), 0)
+            this.gravity = gravity
+            setMargins(dpToPx(sideMarginDp), dpToPx(topMarginDp), dpToPx(sideMarginDp), 0)
         }
 
         overlay.addView(speedBadge, layoutParams)
