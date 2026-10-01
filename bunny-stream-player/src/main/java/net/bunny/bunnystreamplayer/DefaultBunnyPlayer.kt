@@ -74,7 +74,7 @@ class DefaultBunnyPlayer private constructor(private val appContext: Context) : 
         private const val THUMBNAILS_PER_IMAGE = 36
 
         @Volatile
-        private var instance: BunnyPlayer? = null
+        private var instance: DefaultBunnyPlayer? = null
 
         fun getInstance(context: Context) =
             instance ?: synchronized(this) {
@@ -442,46 +442,78 @@ class DefaultBunnyPlayer private constructor(private val appContext: Context) : 
         currentLibraryId = video.videoLibraryId
         resumePosition = playerSettings.resumePosition
 
-        // Set up TransferListener for debugging
-        val transferListener = object : TransferListener {
-            override fun onTransferInitializing(
-                source: DataSource,
-                dataSpec: DataSpec,
-                isNetwork: Boolean
-            ) {
+        val mediaItem = createMediaItem(video, playerSettings, BunnyStreamApi.drmToken, BunnyStreamApi.drmExpires)
 
-            }
+        playerView.setShutterBackgroundColor(Color.TRANSPARENT)
+        playerView.useController = true
+        playerView.keepScreenOn = true
+        Log.d(TAG, "PlayerView attached: ${playerView.isAttachedToWindow}, size: ${playerView.width}x${playerView.height}")
 
-            override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
-                Log.d(TAG, "HTTP ▶️ ${dataSpec.uri}")
-            }
+        val (player, selector) = createExoPlayer()
+        player.addListener(playerListener)
+        trackSelector = selector
+        localPlayer = player
 
-            override fun onBytesTransferred(
-                source: DataSource,
-                dataSpec: DataSpec,
-                isNetwork: Boolean,
-                bytesTransferred: Int
-            ) {
+        currentPlayer = localPlayer
+        playerView.player = currentPlayer
+        playerView.keepScreenOn = true
 
-            }
+        // Prepare and play
+        this.mediaItem = mediaItem
+        currentPlayer!!.setMediaItem(mediaItem)
+        currentPlayer!!.prepare()
 
-            override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
-                Log.d(TAG, "HTTP ✅ ${dataSpec.uri}")
-            }
+        // Check for saved position before starting playback
+        checkForSavedPosition(video.guid ?: "")
+        currentVideoId?.let { videoId ->
+            checkForSavedPosition(videoId)
         }
 
-        // Create HTTP data source factory with headers
-        val httpFactory = DefaultHttpDataSource.Factory()
-            .setAllowCrossProtocolRedirects(true)
-            .setDefaultRequestProperties(mapOf("Referer" to "https://iframe.mediadelivery.net"))
-            .setUserAgent(Util.getUserAgent(context, "BunnyStreamPlayer"))
-            .setTransferListener(transferListener)
+        // Start playback
+        currentPlayer!!.playWhenReady = true
 
-        // Create media source factory without setDrmSessionManagerProvider
-        val mediaSourceFactory = DefaultMediaSourceFactory(context)
-            .setDataSourceFactory(httpFactory)
+        if (speedConfig.rememberLastSpeed) {
+            loadSavedSpeed()
+        }
 
-        // Set up subtitle tracks if available
+        if (resumePosition > 0) {
+            currentPlayer!!.seekTo(resumePosition)
+        }
+
+
+        startProgressSaving(playerSettings.saveProgressInterval)
+        startAutoSavePosition()
+        applyVideoMetadata(video, playerSettings, retentionData)
+    }
+
+    private fun applyVideoMetadata(video: VideoModel, playerSettings: PlayerSettings, retentionData: Map<Int, Int>) {
+        initSeekThumbnailPreview(video, playerSettings.seekPath)
+
+        moments = video.moments?.map {
+            Moment(it.label, it.timestamp?.seconds?.inWholeMilliseconds ?: 0)
+        } ?: emptyList()
+
+        chapters = video.chapters?.map {
+            Chapter(
+                it.start?.seconds?.inWholeMilliseconds ?: 0,
+                it.end?.seconds?.inWholeMilliseconds ?: 0,
+                it.title
+            )
+        } ?: emptyList()
+
+        if (playerSettings.showHeatmap) {
+            this.retentionData = retentionData.map { (ms, pct) ->
+                RetentionGraphEntry(ms, pct)
+            }
+        }
+    }
+
+    private fun createMediaItem(
+        video: VideoModel,
+        playerSettings: PlayerSettings,
+        token: String?,
+        expires: Long?,
+    ): MediaItem {
         val subtitleConfigs = video.captions?.map { cap ->
             val subUri = Uri.parse("${playerSettings.captionsPath}${cap.srclang}.vtt?ver=1")
             MediaItem.SubtitleConfiguration.Builder(subUri)
@@ -491,10 +523,9 @@ class DefaultBunnyPlayer private constructor(private val appContext: Context) : 
                 .build()
         } ?: emptyList()
 
-        // Build MediaItem with DRM config (CENC)
         // Include token and expires for authentication (similar to iOS FairPlay)
-        val tokenParam = BunnyStreamApi.drmToken?.let { "&token=$it" } ?: ""
-        val expiresParam = BunnyStreamApi.drmExpires?.let { "&expires=$it" } ?: ""
+        val tokenParam = token?.let { "&token=$it" } ?: ""
+        val expiresParam = expires?.let { "&expires=$it" } ?: ""
         val drmLicenseUri = "${BunnyStreamApi.baseApi}/WidevineLicense/" +
                 "${video.videoLibraryId}/${video.guid}?contentId=${video.guid}$tokenParam$expiresParam"
 
@@ -520,26 +551,46 @@ class DefaultBunnyPlayer private constructor(private val appContext: Context) : 
             )
         }
 
-        // Create new ExoPlayer and assign to PlayerView
-        trackSelector = DefaultTrackSelector(context)
-        trackSelector?.parameters = trackSelector!!.buildUponParameters()
+        return mediaItemBuilder.build()
+    }
+
+    private fun createExoPlayer(): Pair<ExoPlayer, DefaultTrackSelector> {
+        val transferListener = object : TransferListener {
+            override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {}
+
+            override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
+                Log.d(TAG, "HTTP ▶️ ${dataSpec.uri}")
+            }
+
+            override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {}
+
+            override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
+                Log.d(TAG, "HTTP ✅ ${dataSpec.uri}")
+            }
+        }
+
+        val httpFactory = DefaultHttpDataSource.Factory()
+            .setAllowCrossProtocolRedirects(true)
+            .setDefaultRequestProperties(mapOf("Referer" to "https://iframe.mediadelivery.net"))
+            .setUserAgent(Util.getUserAgent(context, "BunnyStreamPlayer"))
+            .setTransferListener(transferListener)
+
+        val mediaSourceFactory = DefaultMediaSourceFactory(context)
+            .setDataSourceFactory(httpFactory)
+
+        val selector = DefaultTrackSelector(context)
+        selector.parameters = selector.buildUponParameters()
             .setPreferredVideoMimeType(MimeTypes.VIDEO_H264)
             .clearVideoSizeConstraints()
             .build()
 
-        playerView.setShutterBackgroundColor(Color.TRANSPARENT)
-        playerView.useController = true
-        playerView.keepScreenOn = true
-        Log.d(TAG, "PlayerView attached: ${playerView.isAttachedToWindow}, size: ${playerView.width}x${playerView.height}")
-
-        localPlayer = ExoPlayer.Builder(context)
-            .setTrackSelector(trackSelector!!)
+        val player = ExoPlayer.Builder(context)
+            .setTrackSelector(selector)
             .setMediaSourceFactory(mediaSourceFactory)
             .build().also {
-                it.addListener(playerListener)
                 it.addListener(object : Player.Listener {
                     override fun onPlaybackStateChanged(playbackState: Int) {
-                        if (playbackState == Player.STATE_READY && speedConfig.rememberLastSpeed) {
+                        if (playbackState == Player.STATE_READY && speedConfig.rememberLastSpeed && it === currentPlayer && clipControls.seekable) {
                             loadSavedSpeed()
                         }
                     }
@@ -549,14 +600,6 @@ class DefaultBunnyPlayer private constructor(private val appContext: Context) : 
                         Log.d(TAG, "✅ First frame rendered after ${renderTimeMs}ms")
                     }
 
-                    override fun onVideoDecoderInitialized(eventTime: AnalyticsListener.EventTime, decoderName: String, initializedTimestampMs: Long, initializationDurationMs: Long) {
-                        Log.d(TAG, "🎥 Video decoder initialized: $decoderName, took ${initializationDurationMs}ms")
-                    }
-
-                    override fun onDrmSessionAcquired(eventTime: AnalyticsListener.EventTime) {
-                        Log.d(TAG, "🔐 DRM session acquired")
-                    }
-
                     override fun onDrmKeysLoaded(eventTime: AnalyticsListener.EventTime) {
                         Log.d(TAG, "✅ DRM keys loaded successfully")
                     }
@@ -564,67 +607,164 @@ class DefaultBunnyPlayer private constructor(private val appContext: Context) : 
                     override fun onDrmSessionManagerError(eventTime: AnalyticsListener.EventTime, error: Exception) {
                         Log.e(TAG, "❌ DRM session manager error", error)
                     }
-
-                    override fun onTracksChanged(eventTime: AnalyticsListener.EventTime, tracks: Tracks) {
-                        Log.d(TAG, "🎚 Tracks changed:")
-                        for (group in tracks.groups) {
-                            for (i in 0 until group.length) {
-                                val format = group.getTrackFormat(i)
-                                Log.d(TAG, "  - Track: ${format.sampleMimeType}, id=${format.id}, lang=${format.language}, selected=${group.isTrackSelected(i)}")
-                            }
-                        }
-                    }
                 })
             }
+        return player to selector
+    }
 
-        currentPlayer = localPlayer
-        playerView.player = currentPlayer
-        playerView.keepScreenOn = true
+    private class PreparedClip(
+        val player: ExoPlayer,
+        val trackSelector: DefaultTrackSelector,
+        val video: VideoModel,
+        val settings: PlayerSettings,
+        val retentionData: Map<Int, Int>,
+    )
 
-        // Prepare and play
-        val mediaItem = mediaItemBuilder.build()
-        this.mediaItem = mediaItem
-        currentPlayer!!.setMediaItem(mediaItem)
-        currentPlayer!!.prepare()
+    private val clips = mutableMapOf<String, PreparedClip>()
+    private var clipSession = 0
+    private var clipListener: ClipListener? = null
 
-        // Check for saved position before starting playback
-        checkForSavedPosition(video.guid ?: "")
-        currentVideoId?.let { videoId ->
-            checkForSavedPosition(videoId)
+    var activeClipKey: String? = null
+        private set
+
+    override var clipControls: ClipControls = ClipControls.FULL
+        private set
+
+    /** Starts a new set of clips and releases the previous set; only the returned session may change it. */
+    fun beginClipSession(listener: ClipListener): Int {
+        releaseClips()
+        clipListener = listener
+        return ++clipSession
+    }
+
+    fun isCurrentClipSession(session: Int) = session == clipSession
+
+    fun endClipSession(session: Int) {
+        if (session != clipSession) return
+        releaseClips()
+        clipListener = null
+        clipSession++
+    }
+
+    fun reportClipFailure(session: Int, key: String, message: String) {
+        if (session == clipSession) clipListener?.onClipFailed(key, message)
+    }
+
+    /** Buffers [video] paused at [startPositionMs] without showing it; [activateVideo] swaps it in. */
+    fun preloadVideo(
+        session: Int,
+        key: String,
+        video: VideoModel,
+        playerSettings: PlayerSettings,
+        retentionData: Map<Int, Int>,
+        token: String,
+        expires: Long,
+        startPositionMs: Long,
+    ) {
+        if (session != clipSession) return
+        releaseClip(session, key)
+        val (player, selector) = createExoPlayer()
+        player.addListener(clipPlayerListener(session, key, player))
+        player.setMediaItem(createMediaItem(video, playerSettings, token, expires), startPositionMs.coerceAtLeast(0L))
+        player.playWhenReady = false
+        player.prepare()
+        clips[key] = PreparedClip(player, selector, video, playerSettings, retentionData)
+    }
+
+    fun activateVideo(session: Int, key: String, controls: ClipControls) {
+        if (session != clipSession) return
+        val clip = clips[key] ?: return
+        clipControls = controls
+        if (activeClipKey != key) {
+            currentPlayer?.let {
+                it.pause()
+                it.removeListener(playerListener)
+            }
+            activeClipKey = key
+            clip.player.addListener(playerListener)
+            localPlayer = clip.player
+            currentPlayer = clip.player
+            trackSelector = clip.trackSelector
+            mediaItem = clip.player.currentMediaItem
+            playerSettings = clip.settings
+            currentVideo = clip.video
+            currentVideoId = clip.video.guid
+            currentLibraryId = clip.video.videoLibraryId
+            applyVideoMetadata(clip.video, clip.settings, clip.retentionData)
         }
+        applyClipSpeed()
+        playerStateListener?.onActiveVideoChanged()
+    }
 
-        // Start playback
-        currentPlayer!!.playWhenReady = true
+    fun seekClip(session: Int, key: String, positionMs: Long) {
+        if (session != clipSession) return
+        clips[key]?.player?.seekTo(positionMs.coerceAtLeast(0L))
+    }
 
-        if (speedConfig.rememberLastSpeed) {
+    fun releaseClip(session: Int, key: String) {
+        if (session != clipSession) return
+        val clip = clips.remove(key) ?: return
+        if (key == activeClipKey) {
+            clip.player.removeListener(playerListener)
+            currentPlayer = null
+            localPlayer = null
+            activeClipKey = null
+        }
+        clip.player.release()
+    }
+
+    override fun onSkipTapped() {
+        activeClipKey?.let { clipListener?.onSkipTapped(it) }
+    }
+
+    private fun applyClipSpeed() {
+        if (!clipControls.seekable) {
+            currentPlayer?.setPlaybackSpeed(1f)
+        } else if (speedConfig.rememberLastSpeed) {
             loadSavedSpeed()
         }
+    }
 
-        if (resumePosition > 0) {
-            currentPlayer!!.seekTo(resumePosition)
+    private fun releaseClips() {
+        if (clips.values.any { it.player === currentPlayer }) {
+            currentPlayer?.removeListener(playerListener)
+            currentPlayer = null
+            localPlayer = null
+        }
+        clips.values.forEach { it.player.release() }
+        clips.clear()
+        activeClipKey = null
+        clipControls = ClipControls.FULL
+    }
+
+    private fun clipPlayerListener(session: Int, key: String, player: ExoPlayer) = object : Player.Listener {
+        private var reportedReady = false
+
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            if (session != clipSession) return
+            when (playbackState) {
+                Player.STATE_READY -> if (!reportedReady) {
+                    reportedReady = true
+                    clipListener?.onClipReady(key)
+                }
+                Player.STATE_ENDED -> if (key == activeClipKey) clipListener?.onClipEnded(key)
+                else -> Unit
+            }
         }
 
+        override fun onPlayerError(error: PlaybackException) {
+            if (session != clipSession) return
+            clipListener?.onClipFailed(key, "${error.errorCodeName}: ${error.message}")
+        }
 
-        startProgressSaving(playerSettings.saveProgressInterval)
-        startAutoSavePosition()
-        // Init seek thumbnails and metadata
-        initSeekThumbnailPreview(video, playerSettings.seekPath)
-
-        moments = video.moments?.map {
-            Moment(it.label, it.timestamp?.seconds?.inWholeMilliseconds ?: 0)
-        } ?: emptyList()
-
-        chapters = video.chapters?.map {
-            Chapter(
-                it.start?.seconds?.inWholeMilliseconds ?: 0,
-                it.end?.seconds?.inWholeMilliseconds ?: 0,
-                it.title
-            )
-        } ?: emptyList()
-
-        if (playerSettings.showHeatmap) {
-            this.retentionData = retentionData.map { (ms, pct) ->
-                RetentionGraphEntry(ms, pct)
+        override fun onPositionDiscontinuity(
+            oldPosition: Player.PositionInfo,
+            newPosition: Player.PositionInfo,
+            reason: Int,
+        ) {
+            if (session != clipSession) return
+            if (reason == Player.DISCONTINUITY_REASON_SEEK && key == activeClipKey && player === currentPlayer) {
+                clipListener?.onClipSeeked(key, newPosition.positionMs)
             }
         }
     }
@@ -820,8 +960,12 @@ class DefaultBunnyPlayer private constructor(private val appContext: Context) : 
         progressSaveJob?.cancel()
         currentPlayer?.stop()
 
-        localPlayer?.release()
+        if (clips.values.none { it.player === localPlayer }) {
+            localPlayer?.release()
+        }
         localPlayer = null
+        currentPlayer = null
+        releaseClips()
 
         castPlayer?.release()
         castPlayer = null

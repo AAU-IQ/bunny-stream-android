@@ -3,6 +3,7 @@ package net.bunny.bunnystreamplayer.ui.widget
 import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.AttributeSet
@@ -37,6 +38,7 @@ import com.bumptech.glide.Glide
 import com.google.android.gms.cast.framework.CastButtonFactory
 import net.bunny.api.settings.capitalizeWords
 import net.bunny.api.settings.domain.model.PlayerSettings
+import net.bunny.bunnystreamplayer.ClipControls
 import net.bunny.bunnystreamplayer.PlayerStateListener
 import net.bunny.bunnystreamplayer.PlayerType
 import net.bunny.bunnystreamplayer.common.BunnyPlayer
@@ -90,6 +92,7 @@ class BunnyPlayerView @JvmOverloads constructor(
             if (isPlaying) {
                 overlay.removeAllViews()
             }
+            keepScreenOn = isPlaying
         }
 
         override fun onMutedChanged(isMuted: Boolean) {
@@ -129,6 +132,42 @@ class BunnyPlayerView @JvmOverloads constructor(
         override fun onPlayerError(message: String) {
             showError(message)
         }
+
+        override fun onActiveVideoChanged() {
+            val bunny = bunnyPlayer ?: return
+            stopHoldSpeed()
+            keepScreenOn = bunny.isPlaying()
+            setKeepContentOnPlayerReset(true)
+            player = bunny.currentPlayer
+            bunny.seekThumbnail?.let { previewLoader = PreviewLoader(context, it) }
+            playerSettings = bunny.playerSettings
+            updateClipControls()
+        }
+    }
+
+    private val clipControls: ClipControls
+        get() = bunnyPlayer?.clipControls ?: ClipControls.FULL
+
+    private val skipClipButton by lazy {
+        TextView(context).apply {
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            setPadding(dpToPx(16), dpToPx(8), dpToPx(16), dpToPx(8))
+            background = GradientDrawable().apply {
+                cornerRadius = dpToPx(12).toFloat()
+                setColor(0x99000000.toInt())
+                setStroke(dpToPx(1), 0x26FFFFFF)
+            }
+            isVisible = false
+            setOnClickListener { bunnyPlayer?.onSkipTapped() }
+            this@BunnyPlayerView.addView(
+                this,
+                LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.RIGHT).apply {
+                    rightMargin = dpToPx(16)
+                    bottomMargin = dpToPx(56)
+                }
+            )
+        }
     }
 
     var fullscreenListener: FullscreenListener? = null
@@ -138,10 +177,12 @@ class BunnyPlayerView @JvmOverloads constructor(
             field = value
             field?.playerStateListener = playStateListener
             player = bunnyPlayer?.currentPlayer
+            keepScreenOn = value?.isPlaying() == true
             playerSettings = value?.playerSettings
             setPlayerControls()
             initTimeBar()
             applyStyle()
+            updateClipControls()
 
             bunnyPlayer?.seekThumbnail?.let {
                 previewLoader = PreviewLoader(context, it)
@@ -238,6 +279,7 @@ class BunnyPlayerView @JvmOverloads constructor(
     private val i18n = I18n(context)
 
     private var speedBeforeHold: Float? = null
+    private var heldPlayer: Player? = null
 
     private val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
         override fun onDown(e: MotionEvent): Boolean = true
@@ -267,6 +309,7 @@ class BunnyPlayerView @JvmOverloads constructor(
 
     private fun skip(forward: Boolean) {
         val player = bunnyPlayer ?: return
+        if (!clipControls.seekable) return
         val offset = if (forward) GESTURE_SKIP_MS else -GESTURE_SKIP_MS
         val duration = player.getDuration()
         val upperBound = if (duration > 0) duration else Long.MAX_VALUE
@@ -274,19 +317,23 @@ class BunnyPlayerView @JvmOverloads constructor(
         showSkipBadge(forward)
     }
 
+    // Sets the speed on the clip's own player, so the hold is never saved as the remembered speed
     private fun startHoldSpeed() {
-        val player = bunnyPlayer ?: return
-        if (speedBeforeHold != null) return
-        speedBeforeHold = player.getSpeed()
-        player.setSpeed(HOLD_SPEED)
+        val player = bunnyPlayer?.currentPlayer ?: return
+        if (!clipControls.seekable) return
+        if (heldPlayer != null) return
+        speedBeforeHold = player.playbackParameters.speed
+        heldPlayer = player
+        player.setPlaybackSpeed(HOLD_SPEED)
         performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
         showSpeedBadge(HOLD_SPEED, autoHide = false)
     }
 
     private fun stopHoldSpeed() {
-        val speed = speedBeforeHold ?: return
+        val player = heldPlayer ?: return
+        heldPlayer = null
+        player.setPlaybackSpeed(speedBeforeHold ?: 1f)
         speedBeforeHold = null
-        bunnyPlayer?.setSpeed(speed)
         hideSpeedBadge()
     }
 
@@ -742,10 +789,10 @@ class BunnyPlayerView @JvmOverloads constructor(
         })
 
         setControllerVisibilityListener(ControllerVisibilityListener {
-            if (playerSettings?.rewindEnabled == true) {
+            if (playerSettings?.rewindEnabled == true && clipControls.seekable) {
                 replyButton.visibility = it
             }
-            if (playerSettings?.fastForwardEnabled == true) {
+            if (playerSettings?.fastForwardEnabled == true && clipControls.seekable) {
                 forwardButton.visibility = it
             }
             bottomBar.visibility = it
@@ -827,6 +874,21 @@ class BunnyPlayerView @JvmOverloads constructor(
         castButton.isVisible = playerSettings?.castButtonEnabled == true
 
         progressDurationDivider.isVisible = progressTextView.isVisible && durationTextView.isVisible
+        updateClipControls()
+    }
+
+    private fun updateClipControls() {
+        val controls = clipControls
+        timeBar.isSeekingAllowed = controls.seekable
+        if (!controls.seekable) {
+            replyButton.isVisible = false
+            forwardButton.isVisible = false
+            settingsButton.isVisible = false
+            subtitle.isVisible = false
+        }
+        skipClipButton.text = controls.skipLabel
+        skipClipButton.isVisible = controls.skipLabel != null
+        skipClipButton.bringToFront()
     }
 
     fun showPreviewThumbnail(url: String) {

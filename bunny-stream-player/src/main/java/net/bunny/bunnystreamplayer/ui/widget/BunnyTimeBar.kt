@@ -652,8 +652,15 @@ class BunnyTimeBar @JvmOverloads constructor(
         updateGraphGradient()
     }
 
+    // PlayerControlView re-enables the bar on every update, so seeking is locked here instead.
+    var isSeekingAllowed = true
+        set(value) {
+            field = value
+            isEnabled = value
+        }
+
     override fun setEnabled(enabled: Boolean) {
-        super.setEnabled(enabled)
+        super.setEnabled(enabled && isSeekingAllowed)
         if (isScrubbing && !enabled) {
             stopScrubbing(true)
         }
