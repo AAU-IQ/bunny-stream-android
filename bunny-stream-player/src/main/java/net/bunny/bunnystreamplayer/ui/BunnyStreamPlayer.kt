@@ -10,11 +10,14 @@ import android.widget.FrameLayout
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.findViewTreeLifecycleOwner
+import java.io.IOException
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -23,6 +26,8 @@ import net.bunny.api.playback.PlaybackPosition
 import net.bunny.api.playback.ResumeConfig
 import net.bunny.api.playback.ResumePositionListener
 import net.bunny.api.settings.domain.model.PlayerSettings
+import net.bunny.bunnystreamplayer.ClipControls
+import net.bunny.bunnystreamplayer.ClipListener
 import net.bunny.bunnystreamplayer.DefaultBunnyPlayer
 import net.bunny.bunnystreamplayer.common.DeviceType
 import net.bunny.bunnystreamplayer.config.PlaybackSpeedConfig
@@ -31,6 +36,7 @@ import net.bunny.bunnystreamplayer.model.getSanitizedRetentionData
 import net.bunny.bunnystreamplayer.ui.fullscreen.FullScreenPlayerActivity
 import net.bunny.bunnystreamplayer.ui.widget.BunnyPlayerView
 import net.bunny.player.databinding.ViewBunnyVideoPlayerBinding
+import org.openapitools.client.infrastructure.ServerException
 import org.openapitools.client.models.VideoModel
 import org.openapitools.client.models.VideoPlayDataModelVideo
 
@@ -44,6 +50,8 @@ class BunnyStreamPlayer @JvmOverloads constructor(
     companion object {
         private const val TAG = "BunnyVideoPlayer"
         private const val AUTO_SAVE_INTERVAL = 10_000L // 10 seconds
+        private const val FETCH_ATTEMPTS = 3
+        private const val FETCH_RETRY_DELAY_MS = 1_000L
     }
 
     private var job: Job? = null
@@ -51,6 +59,10 @@ class BunnyStreamPlayer @JvmOverloads constructor(
     private var loadVideoJob: Job? = null
     private var autoSaveJob: Job? = null // Add auto-save job
     private var pendingJob: (() -> Job)? = null
+    private val pendingPreloads = mutableMapOf<String, () -> Job>()
+    private val preloadJobs = mutableMapOf<String, Job>()
+    private var clipSession: Int? = null
+    private var isFullscreen = false
 
     private val binding = ViewBunnyVideoPlayerBinding.inflate(LayoutInflater.from(context), this)
 
@@ -177,9 +189,11 @@ class BunnyStreamPlayer @JvmOverloads constructor(
         playerView.fullscreenListener = object : BunnyPlayerView.FullscreenListener {
             override fun onFullscreenToggleClicked() {
                 saveCurrentPosition() // Save before fullscreen transition
+                isFullscreen = true
                 playerView.bunnyPlayer = null
                 FullScreenPlayerActivity.show(context, iconSet) {
                     Log.d(TAG, "onFullscreenExited")
+                    isFullscreen = false
                     playerView.bunnyPlayer = bunnyPlayer
                     startAutoSave() // Resume auto-save after returning from fullscreen
                 }
@@ -200,6 +214,9 @@ class BunnyStreamPlayer @JvmOverloads constructor(
                     pendingJob?.invoke()
                     pendingJob = null
                 }
+                val preloads = pendingPreloads.values.toList()
+                pendingPreloads.clear()
+                preloads.forEach { it.invoke() }
 
                 findViewTreeLifecycleOwner()?.lifecycle?.addObserver(lifecycleObserver)
             }
@@ -228,7 +245,10 @@ class BunnyStreamPlayer @JvmOverloads constructor(
             saveCurrentPosition()
         }
         stopAutoSave()
-        bunnyPlayer.stop()
+        // The player is shared by every view; only the view whose clips it holds may stop it
+        if (clipSession == null || ownsClips) {
+            bunnyPlayer.stop()
+        }
     }
 
     fun setPlaybackSpeedConfig(config: PlaybackSpeedConfig) {
@@ -461,6 +481,128 @@ class BunnyStreamPlayer @JvmOverloads constructor(
 
         loadVideoJob = pendingJob?.invoke()
         pendingJob = null
+    }
+
+    /** Starts this view's set of clips, taking the shared player over from any other view. */
+    fun beginClips(listener: ClipListener) {
+        endClips()
+        clipSession = bunnyPlayer.beginClipSession(listener)
+    }
+
+    val hasClipSession: Boolean
+        get() = clipSession != null
+
+    val ownsClips: Boolean
+        get() = clipSession?.let(bunnyPlayer::isCurrentClipSession) == true
+
+    val activeClipKey: String?
+        get() = if (ownsClips) bunnyPlayer.activeClipKey else null
+
+    fun endClips() {
+        pendingPreloads.clear()
+        preloadJobs.values.forEach { it.cancel() }
+        preloadJobs.clear()
+        clipSession?.let(bunnyPlayer::endClipSession)
+        clipSession = null
+    }
+
+    /** Loads [videoId] into its own paused player under [key]; results arrive through the session's listener. */
+    fun preloadVideoWithToken(
+        key: String,
+        videoId: String,
+        libraryId: Long,
+        token: String,
+        expires: Long,
+        startPositionMs: Long,
+    ) {
+        val session = clipSession ?: return
+        val preload = {
+            scope!!.launch {
+                try {
+                    val api = BunnyStreamApi.getInstance()
+                    val video = retryingTransientFailures(key) {
+                        withContext(Dispatchers.IO) {
+                            api.videosApi.videoGetVideoPlayData(libraryId, videoId, token = token, expires = expires)
+                                .video?.toVideoModel()
+                        }
+                    } ?: throw IllegalStateException("Video $videoId has no play data")
+                    val settings = retryingTransientFailures(key) {
+                        api.fetchPlayerSettingsWithToken(libraryId, videoId, token, expires)
+                            .fold(ifLeft = { throw SettingsFetchException(it) }, ifRight = { it })
+                    }
+                    val retentionData = if (settings.showHeatmap) fetchRetentionData(video) else emptyMap()
+                    ensureActive()
+                    bunnyPlayer.preloadVideo(session, key, video, settings, retentionData, token, expires, startPositionMs)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error preloading $key: $e")
+                    bunnyPlayer.reportClipFailure(session, key, e.message ?: e.toString())
+                }
+            }.also { job ->
+                preloadJobs[key] = job
+                job.invokeOnCompletion { if (preloadJobs[key] === job) preloadJobs.remove(key) }
+            }
+        }
+        preloadJobs.remove(key)?.cancel()
+        if (scope == null) {
+            pendingPreloads[key] = preload
+        } else {
+            preload()
+        }
+    }
+
+    fun releaseClip(key: String) {
+        pendingPreloads.remove(key)
+        preloadJobs.remove(key)?.cancel()
+        clipSession?.let { bunnyPlayer.releaseClip(it, key) }
+    }
+
+    private suspend fun <T> retryingTransientFailures(key: String, fetch: suspend () -> T): T {
+        repeat(FETCH_ATTEMPTS - 1) { attempt ->
+            try {
+                return fetch()
+            } catch (e: Exception) {
+                if (!e.isTransient()) throw e
+                Log.w(TAG, "Retrying $key after attempt ${attempt + 1}: $e")
+                delay(FETCH_RETRY_DELAY_MS * (attempt + 1))
+            }
+        }
+        return fetch()
+    }
+
+    private fun Exception.isTransient(): Boolean = when (this) {
+        is ServerException, is IOException -> true
+        is SettingsFetchException -> isTransient
+        else -> false
+    }
+
+    // DefaultSettingsRepository reports failures as strings: "Error: <status>" or "Unknown exception: <cause>".
+    private class SettingsFetchException(message: String) : IllegalStateException(message) {
+        val isTransient = message.startsWith("Error: 5") || message.startsWith("Unknown exception")
+    }
+
+    fun activateVideo(key: String, controls: ClipControls) {
+        val session = clipSession ?: return
+        bunnyPlayer.activateVideo(session, key, controls)
+        if (!isFullscreen && playerView.bunnyPlayer == null) {
+            playerView.bunnyPlayer = bunnyPlayer
+        }
+    }
+
+    fun seekClip(key: String, positionMs: Long) {
+        clipSession?.let { bunnyPlayer.seekClip(it, key, positionMs) }
+    }
+
+    private suspend fun fetchRetentionData(video: VideoModel): Map<Int, Int> = try {
+        withContext(Dispatchers.IO) {
+            BunnyStreamApi.getInstance().videosApi.videoGetVideoHeatmap(video.videoLibraryId!!, video.guid!!)
+        }.getSanitizedRetentionData()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Log.w(TAG, "Error fetching video heatmap")
+        emptyMap()
     }
 
     override fun pause() {

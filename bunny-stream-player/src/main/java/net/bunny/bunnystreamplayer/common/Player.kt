@@ -10,6 +10,7 @@ import net.bunny.api.playback.PlaybackPositionManager
 import net.bunny.api.playback.ResumeConfig
 import net.bunny.api.playback.ResumePositionListener
 import net.bunny.api.settings.domain.model.PlayerSettings
+import net.bunny.bunnystreamplayer.ClipControls
 import net.bunny.bunnystreamplayer.PlayerStateListener
 import net.bunny.bunnystreamplayer.config.PlaybackSpeedConfig
 import net.bunny.bunnystreamplayer.model.AudioTrackInfo
@@ -32,6 +33,10 @@ interface BunnyPlayer {
 
     // Add context access for TV detection
     val context: Context
+
+    val clipControls: ClipControls get() = ClipControls.FULL
+
+    fun onSkipTapped() {}
 
     /* Releases the resources held by the player, such as codecs. */
     fun release()

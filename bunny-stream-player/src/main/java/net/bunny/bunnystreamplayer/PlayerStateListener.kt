@@ -15,4 +15,5 @@ interface PlayerStateListener {
     fun onMomentsUpdated(moments: List<Moment>)
     fun onRetentionGraphUpdated(points: List<RetentionGraphEntry>)
     fun onPlayerError(message: String)
+    fun onActiveVideoChanged() {}
 }
